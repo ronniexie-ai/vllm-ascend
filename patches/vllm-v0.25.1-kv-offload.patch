@@ -1,0 +1,343 @@
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 81ac05f..dce44c2 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -550,6 +550,12 @@ class BlockPool:
+         Returns:
+             A list of new block.
+         """
++        if num_blocks <= 0:
++            # A non-positive request must never reach popleft_n(): with n<0 it
++            # would inflate the free counter via `num_free_blocks -= n` while
++            # `range(n)` pops nothing, drifting the counter off the free-list.
++            return []
++
+         if num_blocks > self.get_num_free_blocks():
+             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 8e01035..e699daa 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -305,6 +305,11 @@ class Scheduler(SchedulerInterface):
+         # FIFO of (fence_seq, blocks): blocks become safe to free once
+         # processed_step_seq >= fence_seq.
+         self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
++        self._skipped_free_fence_logged = False
++        if self.defer_block_free:
++            for manager in self.kv_cache_manager.coordinator.single_type_managers:
++                manager.free_skipped_blocks = self._free_skipped_blocks
++            logger.info("SWA eviction fence enabled for overlapping KV consumers")
+ 
+         self.perf_metrics: ModelMetrics | None = None
+         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
+@@ -542,6 +547,12 @@ class Scheduler(SchedulerInterface):
+                         # The request can be scheduled.
+                         break
+ 
++                    # Reclaim in-flight blocks before preempting for a
++                    # temporary shortage. The engine drains the oldest batch
++                    # even when this scheduling step contains no tokens.
++                    if self.deferred_frees:
++                        break
++
+                     # The request cannot be scheduled.
+                     # Preempt the lowest-priority request.
+                     if self.policy == SchedulingPolicy.PRIORITY:
+@@ -2142,6 +2153,23 @@ class Scheduler(SchedulerInterface):
+         if blocks:
+             self.deferred_frees.append((self.sched_step_seq, blocks))
+ 
++    def _free_skipped_blocks(self, blocks: list[KVCacheBlock]) -> None:
++        # SWA eviction happens during schedule(), before the previous batch
++        # is processed. Keep its references until that batch completes so a
++        # connector cannot reload into pages that are still read or written.
++        if self.sched_step_seq > self.processed_step_seq:
++            # SWA supplies tail-first blocks; the shared drain reverses its
++            # entries for request-end frees. Preserve SWA's immediate order.
++            self.deferred_frees.append((self.sched_step_seq, list(reversed(blocks))))
++            if not self._skipped_free_fence_logged:
++                logger.info(
++                    "SWA eviction fence active: held=%d fence=%d processed=%d",
++                    len(blocks), self.sched_step_seq, self.processed_step_seq,
++                )
++                self._skipped_free_fence_logged = True
++        else:
++            self.kv_cache_manager.block_pool.free_blocks(blocks)
++
+     def _drain_deferred_frees(self):
+         """Return deferred blocks whose fence step has completed.
+ 
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 642fe3e..5e1ecb3 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -71,6 +71,8 @@ class SingleTypeKVCacheManager(ABC):
+             self.block_size *= dcp_world_size * pcp_world_size
+         self.kv_cache_spec = kv_cache_spec
+         self.block_pool = block_pool
++        # The scheduler may fence sliding-window eviction against in-flight batches.
++        self.free_skipped_blocks = block_pool.free_blocks
+         self.enable_caching = enable_caching
+         self._max_admission_blocks_per_request = max_admission_blocks_per_request
+         self.new_block_ids: list[int] = []
+@@ -264,9 +266,16 @@ class SingleTypeKVCacheManager(ABC):
+             return
+ 
+         req_blocks = self.req_to_blocks[request_id]
+-        allocated_blocks = self.block_pool.get_new_blocks(
++        num_blocks_to_alloc = (
+             cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+         )
++        if num_blocks_to_alloc <= 0:
++            # The request's block list already covers (or exceeds) the computed
++            # tokens (e.g. null-padded skipped blocks), so there are no external
++            # blocks to allocate. Passing a non-positive count to get_new_blocks
++            # would inflate the free-list counter via popleft_n(n<0).
++            return
++        allocated_blocks = self.block_pool.get_new_blocks(num_blocks_to_alloc)
+         req_blocks.extend(allocated_blocks)
+         if type(self.kv_cache_spec) in (
+             FullAttentionSpec,
+@@ -502,7 +511,7 @@ class SingleTypeKVCacheManager(ABC):
+             freed.append(blocks[i])
+             blocks[i] = self._null_block
+         if freed:
+-            self.block_pool.free_blocks(freed)
++            self.free_skipped_blocks(freed)
+ 
+     def remove_skipped_blocks(
+         self,
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index dfaa223..4b1ca88 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -13,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.core.block_pool import BlockPool
++from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+ from vllm.v1.core.kv_cache_coordinator import (
+     KVCacheCoordinator,
+     get_kv_cache_coordinator,
+@@ -38,6 +39,11 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++def _get_group_token_span(spec: Any, cp_world_size: int) -> int:
++    compress_ratio = max(int(getattr(spec, "compress_ratio", 1) or 1), 1)
++    return int(spec.block_size) * cp_world_size * compress_ratio
++
++
+ @dataclass
+ class TransferMeta:
+     gpu_block_ids: list[int]
+@@ -101,15 +107,12 @@ class SimpleCPUOffloadScheduler:
+                 self.fa_gidx = g_idx
+                 break
+         assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
+-        # FA group's own block_size; divides scheduler_block_size (the LCM)
+-        # but is NOT assumed to equal it.
+-        self.fa_block_size: int = (
+-            self.cpu_kv_cache_config.kv_cache_groups[
+-                self.fa_gidx
+-            ].kv_cache_spec.block_size
+-            * self.cp_world_size
++        # FA group's compression- and CP-aware token span divides the
++        # scheduler block size (the LCM), but is NOT assumed to equal it.
++        self.fa_block_size = _get_group_token_span(
++            self.cpu_kv_cache_config.kv_cache_groups[self.fa_gidx].kv_cache_spec,
++            self.cp_world_size,
+         )
+-        assert self.block_size % self.fa_block_size == 0
+ 
+         logger.info(
+             "SimpleCPUOffloadScheduler: Allocating %d CPU blocks (%.2f GB, mode=%s)",
+@@ -168,6 +171,7 @@ class SimpleCPUOffloadScheduler:
+         self._reqs_to_store: dict[str, StoreRequestState] = {}
+         self._store_event_to_reqs: dict[int, list[str]] = {}
+         self._in_flight_store_gpu_blocks: set[int] = set()
++        self._stale_store_identity_skips = 0
+         self._abandoned_reqs_to_load: dict[str, LoadRequestState] = {}
+ 
+         # Event counters
+@@ -320,14 +324,10 @@ class SimpleCPUOffloadScheduler:
+             return
+ 
+         if pending is None:
+-            logger.warning(
+-                "SimpleCPUOffloadScheduler: update_state_after_alloc called "
+-                "for req_id=%s with num_external_tokens=%d but no pending "
+-                "CPU hit from get_num_new_matched_tokens(); skipping load.",
+-                req_id,
+-                num_external_tokens,
++            raise ValueError(
++                f"req={req_id}: num_external_tokens={num_external_tokens} "
++                "but no pending CPU hit to load"
+             )
+-            return
+ 
+         cpu_hit_blocks_full, _ = pending
+ 
+@@ -351,8 +351,8 @@ class SimpleCPUOffloadScheduler:
+         # the rest will be released along with the temp pin below.
+         cpu_hit_blocks: list[list[KVCacheBlock]] = []
+         for g in range(num_groups):
+-            g_block_size = (
+-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
++            g_block_size = _get_group_token_span(
++                kv_cache_groups[g].kv_cache_spec, self.cp_world_size
+             )
+             assert num_external_tokens % g_block_size == 0, (
+                 f"num_external_tokens={num_external_tokens} not aligned to "
+@@ -371,15 +371,19 @@ class SimpleCPUOffloadScheduler:
+             if n_ext_g == 0:
+                 continue
+ 
+-            # Number of blocks in the computed range for this group.
+-            g_block_size = (
+-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
++            group_gpu_ids = block_ids_by_group[g]
++            g_block_size = _get_group_token_span(
++                kv_cache_groups[g].kv_cache_spec, self.cp_world_size
+             )
+             n_computed_g = cdiv(total_computed_tokens, g_block_size)
+-
+-            # Back-trace: ext blocks sit at the tail of the computed range.
+             gpu_ext_start = n_computed_g - n_ext_g
+-            group_gpu_ids = block_ids_by_group[g]
++            if gpu_ext_start < 0 or gpu_ext_start + n_ext_g > len(group_gpu_ids):
++                self._free_pending_cpu_hit(pending)
++                raise ValueError(
++                    f"req={req_id} group={g}: external GPU block range "
++                    f"[{gpu_ext_start}, {gpu_ext_start + n_ext_g}) exceeds "
++                    f"group block count={len(group_gpu_ids)}"
++                )
+ 
+             for i, cpu_blk in enumerate(cpu_blocks_g):
+                 # Skip null blocks (e.g. sliding window or mamba padding).
+@@ -389,6 +393,15 @@ class SimpleCPUOffloadScheduler:
+                 cpu_block_ids.append(cpu_blk.block_id)
+                 cpu_blocks_to_touch.append(cpu_blk)
+ 
++        # Reject an invalid hit before taking transfer pins. Otherwise the
++        # scheduler waits for a load that was never registered.
++        if not gpu_block_ids:
++            self._free_pending_cpu_hit(pending)
++            raise ValueError(
++                f"req={req_id}: num_external_tokens={num_external_tokens} "
++                "but no non-null CPU blocks to load"
++            )
++
+         # Touch CPU blocks to prevent eviction during async load.
+         self.cpu_block_pool.touch(cpu_blocks_to_touch)
+         # Release the temporary pin held since get_num_new_matched_tokens().
+@@ -594,8 +607,6 @@ class SimpleCPUOffloadScheduler:
+             # Confirmed tokens: KV data written and visible to all streams.
+             req = state.request
+             confirmed_tokens = req.num_computed_tokens - req.num_output_placeholders
+-            # Cap to blocks with confirmed KV data.
+-            aligned_tokens = confirmed_tokens // self.block_size * self.block_size
+ 
+             for g in range(num_groups):
+                 # FIXME (yifan): handle CPU cache eviction, where
+@@ -604,13 +615,13 @@ class SimpleCPUOffloadScheduler:
+                 already_stored_g = state.num_stored_blocks[g]
+                 group_gpu_ids = block_ids_by_group[g]
+ 
+-                g_block_size = (
+-                    kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
++                g_block_size = _get_group_token_span(
++                    kv_cache_groups[g].kv_cache_spec, self.cp_world_size
+                 )
+-                ready_blocks_g = aligned_tokens // g_block_size
++                ready_blocks_g = confirmed_tokens // g_block_size
+                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
+ 
+-                for gpu_block_id in scannable:
++                for logical_idx, gpu_block_id in enumerate(scannable, already_stored_g):
+                     gpu_block = gpu_block_pool.blocks[gpu_block_id]
+                     if gpu_block.is_null:
+                         advanced_per_group[g] += 1
+@@ -623,6 +634,25 @@ class SimpleCPUOffloadScheduler:
+                         advanced_per_group[g] += 1
+                         continue
+ 
++                    # SWA eviction can leave an old physical ID in this cursor.
++                    # A's confirmed tokens do not prove a reused page for B is
++                    # computed. Validate its logical identity before pin/store.
++                    hash_idx = (logical_idx + 1) * g_block_size // self.hash_block_size - 1
++                    expected_hash = (
++                        make_block_hash_with_group_id(req.block_hashes[hash_idx], g)
++                        if 0 <= hash_idx < len(req.block_hashes) else None
++                    )
++                    if bhash_with_group != expected_hash:
++                        self._stale_store_identity_skips += 1
++                        if self._stale_store_identity_skips <= 8:
++                            logger.warning(
++                                "Skipped stale offload store identity: req=%s group=%d "
++                                "logical=%d physical=%d confirmed=%d",
++                                req_id, g, logical_idx, gpu_block_id, confirmed_tokens,
++                            )
++                        advanced_per_group[g] += 1
++                        continue
++
+                     # Skip if already scheduled for store or already cached in CPU.
+                     if (
+                         gpu_block_id in in_flight
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index 9cb9c02..d04e63d 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -221,6 +221,10 @@ class SimpleCPUOffloadWorker:
+             - finished_sending: always None (stores use worker metadata).
+             - finished_recving: req_ids whose loads have completed.
+         """
++        check_error = getattr(self._backend, "check_error", None)
++        if check_error is not None:
++            check_error()
++
+         # (1) Submit transfers
+         metadata = self._connector_metadata
+         if metadata is not None:
+@@ -285,14 +289,23 @@ class SimpleCPUOffloadWorker:
+         self._flush_and_sync_all()
+ 
+     def _flush_and_sync_all(self) -> None:
+-        """Synchronize all in-flight transfer events."""
++        """Synchronize queued and device-submitted transfers before reuse."""
++        drain = getattr(self._backend, "drain_submissions", None)
++        if drain is not None:
++            drain()
++        # Descriptor retention is backend-specific; CUDA has no release hook.
++        release = getattr(self._backend, "release_completed", None)
+         for event_idx, event in self._load_events:
+             event.synchronize()
++            if release is not None:
++                release(is_store=False, event_idx=event_idx)
+             self._load_hwm = event_idx
+         self._load_events.clear()
+ 
+         for event_idx, event in self._store_events:
+             event.synchronize()
++            if release is not None:
++                release(is_store=True, event_idx=event_idx)
+             self._store_hwm = event_idx
+         self._store_events.clear()
+ 
+@@ -300,12 +313,15 @@ class SimpleCPUOffloadWorker:
+         """Non-blocking poll for completed events and return the high-water mark."""
+         events = self._store_events if is_store else self._load_events
+         hwm = self._store_hwm if is_store else self._load_hwm
++        release = getattr(self._backend, "release_completed", None)
+         while events:
+             event_idx, event = events[0]
+             if not event.query():
+                 break
+             hwm = event_idx
+             events.pop(0)
++            if release is not None:
++                release(is_store=is_store, event_idx=event_idx)
+         if is_store:
+             self._store_hwm = hwm
+         else:

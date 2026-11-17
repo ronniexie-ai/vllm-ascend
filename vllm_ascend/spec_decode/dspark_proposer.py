@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -14,6 +16,13 @@ from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
+
+# Opt-in, default-off candidate switch for the runtime (non-profile) DSpark
+# idle dummy. Read once at import so every worker of one process agrees and a
+# flag-off process keeps the original data path and call sequence.
+_DUMMY_CONTEXT_GUARD_ENV = "VLLM_DSPARK_DUMMY_CONTEXT_GUARD"
+_DUMMY_CONTEXT_GUARD_ENABLED = os.environ.get(_DUMMY_CONTEXT_GUARD_ENV, "0") == "1"
+_DUMMY_CONTEXT_GUARD_LOG_EVERY = 256
 
 
 class AscendDSparkProposer(AscendDflashProposer):
@@ -350,12 +359,46 @@ class AscendDSparkProposer(AscendDflashProposer):
 
             else:
                 self._dflash_num_context = num_input_tokens
-                self._runnable(
-                    num_input_tokens=num_input_tokens,
-                    batch_size=num_reqs,
-                    token_indices_to_sample=self.token_indices_to_sample[: num_reqs * self.num_speculative_tokens],
-                    target_positions=self._get_positions(num_input_tokens),
-                    inputs_embeds=None,
-                    multi_steps_attn_metadata=[],
-                    num_tokens=num_input_tokens,
-                )
+                guard_active = _DUMMY_CONTEXT_GUARD_ENABLED
+                saved_context_slot_mapping_buffers = None
+                if guard_active:
+                    # Host-only diagnostics: the entry/activation counters prove
+                    # that the guard actually ran before any result is credited
+                    # to it. No device tensor or slot value is read, and no
+                    # flush or device synchronisation is performed.
+                    entries = getattr(self, "_dummy_context_guard_runtime_entries", 0) + 1
+                    self._dummy_context_guard_runtime_entries = entries
+                    saved_context_slot_mapping_buffers = self._context_slot_mapping_buffers
+                    activations = getattr(self, "_dummy_context_guard_activations", 0)
+                    if saved_context_slot_mapping_buffers is not None:
+                        activations += 1
+                        self._dummy_context_guard_activations = activations
+                    if entries == 1 or activations == 1 or entries % _DUMMY_CONTEXT_GUARD_LOG_EVERY == 0:
+                        logger.info(
+                            "DSpark dummy context guard: %s=1 runtime_dummy_entries=%d guard_activations=%d",
+                            _DUMMY_CONTEXT_GUARD_ENV,
+                            entries,
+                            activations,
+                        )
+                    # The dummy reuses the previous request's positive context
+                    # slot mapping. Passing the same None sentinel that
+                    # set_inputs_first_pass uses before a request fills the list
+                    # makes precompute_and_store_context_kv return before
+                    # _project_shared_kv and the cache scatter. The model forward
+                    # and every collective below stay untouched.
+                    self._context_slot_mapping_buffers = None
+                try:
+                    self._runnable(
+                        num_input_tokens=num_input_tokens,
+                        batch_size=num_reqs,
+                        token_indices_to_sample=self.token_indices_to_sample[: num_reqs * self.num_speculative_tokens],
+                        target_positions=self._get_positions(num_input_tokens),
+                        inputs_embeds=None,
+                        multi_steps_attn_metadata=[],
+                        num_tokens=num_input_tokens,
+                    )
+                finally:
+                    if guard_active:
+                        # Restore the exact original list object, even when the
+                        # runnable raises.
+                        self._context_slot_mapping_buffers = saved_context_slot_mapping_buffers
