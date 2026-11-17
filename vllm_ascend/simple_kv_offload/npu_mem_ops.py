@@ -80,7 +80,7 @@ def copy_blocks(
     """
     n = len(src_block_ids)
     if n == 0:
-        return
+        return None
     assert n == len(dst_block_ids), "src/dst block counts must match"
 
     src_ids = np.asarray(src_block_ids, dtype=np.int64)
@@ -97,3 +97,6 @@ def copy_blocks(
     batch_sizes = torch.from_numpy(sz_all)
 
     torch.ops._C_ascend.swap_blocks_batch(batch_src, batch_dst, batch_sizes, params.direction)
+    # Keep descriptor tensors alive until the copy event fires (use-after-free
+    # fix for device fault 507001).
+    return batch_src, batch_dst, batch_sizes
