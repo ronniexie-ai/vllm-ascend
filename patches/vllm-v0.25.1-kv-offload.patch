@@ -1,0 +1,145 @@
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 81ac05f..dce44c2 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -550,6 +550,12 @@ class BlockPool:
+         Returns:
+             A list of new block.
+         """
++        if num_blocks <= 0:
++            # A non-positive request must never reach popleft_n(): with n<0 it
++            # would inflate the free counter via `num_free_blocks -= n` while
++            # `range(n)` pops nothing, drifting the counter off the free-list.
++            return []
++
+         if num_blocks > self.get_num_free_blocks():
+             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+ 
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 642fe3e..f1362a2 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -264,9 +264,16 @@ class SingleTypeKVCacheManager(ABC):
+             return
+ 
+         req_blocks = self.req_to_blocks[request_id]
+-        allocated_blocks = self.block_pool.get_new_blocks(
++        num_blocks_to_alloc = (
+             cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+         )
++        if num_blocks_to_alloc <= 0:
++            # The request's block list already covers (or exceeds) the computed
++            # tokens (e.g. null-padded skipped blocks), so there are no external
++            # blocks to allocate. Passing a non-positive count to get_new_blocks
++            # would inflate the free-list counter via popleft_n(n<0).
++            return
++        allocated_blocks = self.block_pool.get_new_blocks(num_blocks_to_alloc)
+         req_blocks.extend(allocated_blocks)
+         if type(self.kv_cache_spec) in (
+             FullAttentionSpec,
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index dfaa223..a0756e6 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -38,6 +38,11 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++def _get_group_token_span(spec: Any, cp_world_size: int) -> int:
++    compress_ratio = max(int(getattr(spec, "compress_ratio", 1) or 1), 1)
++    return int(spec.block_size) * cp_world_size * compress_ratio
++
++
+ @dataclass
+ class TransferMeta:
+     gpu_block_ids: list[int]
+@@ -101,15 +106,12 @@ class SimpleCPUOffloadScheduler:
+                 self.fa_gidx = g_idx
+                 break
+         assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
+-        # FA group's own block_size; divides scheduler_block_size (the LCM)
+-        # but is NOT assumed to equal it.
+-        self.fa_block_size: int = (
+-            self.cpu_kv_cache_config.kv_cache_groups[
+-                self.fa_gidx
+-            ].kv_cache_spec.block_size
+-            * self.cp_world_size
++        # FA group's compression- and CP-aware token span divides the
++        # scheduler block size (the LCM), but is NOT assumed to equal it.
++        self.fa_block_size = _get_group_token_span(
++            self.cpu_kv_cache_config.kv_cache_groups[self.fa_gidx].kv_cache_spec,
++            self.cp_world_size,
+         )
+-        assert self.block_size % self.fa_block_size == 0
+ 
+         logger.info(
+             "SimpleCPUOffloadScheduler: Allocating %d CPU blocks (%.2f GB, mode=%s)",
+@@ -351,8 +353,8 @@ class SimpleCPUOffloadScheduler:
+         # the rest will be released along with the temp pin below.
+         cpu_hit_blocks: list[list[KVCacheBlock]] = []
+         for g in range(num_groups):
+-            g_block_size = (
+-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
++            g_block_size = _get_group_token_span(
++                kv_cache_groups[g].kv_cache_spec, self.cp_world_size
+             )
+             assert num_external_tokens % g_block_size == 0, (
+                 f"num_external_tokens={num_external_tokens} not aligned to "
+@@ -371,15 +373,19 @@ class SimpleCPUOffloadScheduler:
+             if n_ext_g == 0:
+                 continue
+ 
+-            # Number of blocks in the computed range for this group.
+-            g_block_size = (
+-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
++            group_gpu_ids = block_ids_by_group[g]
++            g_block_size = _get_group_token_span(
++                kv_cache_groups[g].kv_cache_spec, self.cp_world_size
+             )
+             n_computed_g = cdiv(total_computed_tokens, g_block_size)
+-
+-            # Back-trace: ext blocks sit at the tail of the computed range.
+             gpu_ext_start = n_computed_g - n_ext_g
+-            group_gpu_ids = block_ids_by_group[g]
++            if gpu_ext_start < 0 or gpu_ext_start + n_ext_g > len(group_gpu_ids):
++                self._free_pending_cpu_hit(pending)
++                raise ValueError(
++                    f"req={req_id} group={g}: external GPU block range "
++                    f"[{gpu_ext_start}, {gpu_ext_start + n_ext_g}) exceeds "
++                    f"group block count={len(group_gpu_ids)}"
++                )
+ 
+             for i, cpu_blk in enumerate(cpu_blocks_g):
+                 # Skip null blocks (e.g. sliding window or mamba padding).
+@@ -400,6 +406,8 @@ class SimpleCPUOffloadScheduler:
+             [self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
+         )
+ 
++        if not gpu_block_ids or len(gpu_block_ids) != len(cpu_block_ids):
++            return
+         assert self._reqs_to_load.get(req_id) is None
+         self._reqs_to_load[req_id] = LoadRequestState(
+             request=request, transfer_meta=TransferMeta(gpu_block_ids, cpu_block_ids)
+@@ -594,8 +602,6 @@ class SimpleCPUOffloadScheduler:
+             # Confirmed tokens: KV data written and visible to all streams.
+             req = state.request
+             confirmed_tokens = req.num_computed_tokens - req.num_output_placeholders
+-            # Cap to blocks with confirmed KV data.
+-            aligned_tokens = confirmed_tokens // self.block_size * self.block_size
+ 
+             for g in range(num_groups):
+                 # FIXME (yifan): handle CPU cache eviction, where
+@@ -604,10 +610,10 @@ class SimpleCPUOffloadScheduler:
+                 already_stored_g = state.num_stored_blocks[g]
+                 group_gpu_ids = block_ids_by_group[g]
+ 
+-                g_block_size = (
+-                    kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
++                g_block_size = _get_group_token_span(
++                    kv_cache_groups[g].kv_cache_spec, self.cp_world_size
+                 )
+-                ready_blocks_g = aligned_tokens // g_block_size
++                ready_blocks_g = confirmed_tokens // g_block_size
+                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
+ 
+                 for gpu_block_id in scannable:

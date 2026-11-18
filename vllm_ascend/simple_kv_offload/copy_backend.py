@@ -40,6 +40,9 @@ class NPUDmaCopyBackend:
         self._queue: queue.SimpleQueue | None = None
         self._thread: threading.Thread | None = None
         self._shutdown: bool = False
+        # Hold descriptor tensors from copy_blocks() until their copy events
+        # fire, to prevent a use-after-free in the async memcpy.
+        self._keep_alive: list = []
 
     def init(
         self,
@@ -122,7 +125,13 @@ class NPUDmaCopyBackend:
             with torch.npu.stream(stream):
                 if wait_event is not None:
                     stream.wait_event(wait_event)
-                copy_blocks(src_blocks, dst_blocks, params)
+                keep_alive = copy_blocks(src_blocks, dst_blocks, params)
                 event = torch.npu.Event()
                 event.record(stream)
+            if keep_alive is not None:
+                self._keep_alive.append(keep_alive)
+                # Bounded: drop the oldest once far enough back that its copy
+                # must have completed (events are FIFO, polled by the worker).
+                if len(self._keep_alive) > 64:
+                    self._keep_alive.pop(0)
             events_list.append((event_idx, event))
